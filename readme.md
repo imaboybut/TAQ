@@ -70,3 +70,5 @@ TAQ uses video structure only during offline calibration and produces a single s
 └── README.md
 ```
 
+## Note
+We are currently preparing the camera-ready submission. The full calibration code will be released after the conference presentation.
