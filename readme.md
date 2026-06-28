@@ -70,13 +70,3 @@ TAQ uses video structure only during offline calibration and produces a single s
 └── README.md
 ```
 
-## Citation
-
-```bibtex
-@inproceedings{chung2026taq,
-  title={TAQ: Static-Deployable Temporal-Aware Quantization for Real-World Video Super-Resolution},
-  author={Chung, Jinwoo and An, Sangho and Jung, Sungyeop and Kim, Jangho},
-  booktitle={European Conference on Computer Vision},
-  year={2026}
-}
-```
