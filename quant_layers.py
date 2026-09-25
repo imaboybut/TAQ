@@ -1,24 +1,31 @@
+"""Fake-quantised Conv2d / Linear wrappers using the affine quantiser of paper Sec. 3.1."""
+
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from calibration import search_weight_bounds
 
 
 class FakeQuantizerBase(nn.Module):
+    """Uniform asymmetric (affine) fake quantiser Q_b(v; lb, ub) of Eq. (1).
+
+    ``calibrated`` is False until bounds have been installed. An uncalibrated
+    quantiser, or one with ``identity`` set, passes its input through unchanged
+    (this is how activations are captured during calibration).
+    """
+
     def __init__(self, bit: int = 4) -> None:
         super().__init__()
         self.bit = bit
         self.lb = torch.tensor(0.0)
         self.ub = torch.tensor(0.0)
         self.identity = False
-
-
-    def set_n_bit_manually(self, bit: int) -> None:
-        self.bit = bit
+        self.calibrated = False
 
     def set_params_lb_manually(self, lb: float) -> None:
         device = self.lb.device
@@ -29,7 +36,8 @@ class FakeQuantizerBase(nn.Module):
         self.ub = torch.tensor(float(ub), device=device)
 
     def quantise(self, tensor: Tensor) -> Tensor:
-
+        if self.identity or not self.calibrated:
+            return tensor
         lb = self.lb.to(tensor.device, tensor.dtype)
         ub = self.ub.to(tensor.device, tensor.dtype)
         levels = (1 << self.bit) - 1
@@ -40,7 +48,7 @@ class FakeQuantizerBase(nn.Module):
         normalised = (tensor - lb) / scale
         clipped = torch.clamp(normalised, 0.0, float(levels))
         quantised = torch.round(clipped)
-        # Straight-through estimator: keep gradient wrt lb/ub/scale.
+        # Identity straight-through estimator: gradients reach lb/ub/scale.
         normalised = normalised + (quantised - normalised).detach()
         return normalised * scale + lb
 
@@ -49,25 +57,28 @@ class FakeQuantizerBase(nn.Module):
 
 
 class FakeQuantizerWeight(FakeQuantizerBase):
-    def __init__(self, bit: int = 4) -> None:
-        super().__init__(bit=bit)
+    def calibrate(self, tensor: Tensor) -> None:
+        """MSE-optimal (lb, ub) for a weight tensor (Algorithm 1, line 3)."""
+        arr = tensor.detach().cpu().numpy()
+        lb, ub = search_weight_bounds(arr, self.bit)
+        self.lb = torch.tensor(lb, device=tensor.device, dtype=tensor.dtype)
+        self.ub = torch.tensor(ub, device=tensor.device, dtype=tensor.dtype)
+        self.calibrated = True
 
 
 class FakeQuantizerAct(FakeQuantizerBase):
-    def __init__(self, bit: int = 4) -> None:
-        super().__init__(bit=bit)
+    pass
 
 
 class QuantConv2d(nn.Module):
-    def __init__(self, config: dict) -> None:
+    def __init__(self, w_bit: int, a_bit: int) -> None:
         super().__init__()
-        bit = config.get("bit", 4)
         self.weight = nn.Parameter(torch.empty(0))
         self.bias: Optional[nn.Parameter] = None
         self.kwargs: dict = {}
         self.quant = True
-        self.weight_quantizer = FakeQuantizerWeight(bit=bit)
-        self.act_quantizer = FakeQuantizerAct(bit=bit)
+        self.weight_quantizer = FakeQuantizerWeight(bit=w_bit)
+        self.act_quantizer = FakeQuantizerAct(bit=a_bit)
 
     def set_param(self, conv: nn.Conv2d) -> None:
         self.weight = nn.Parameter(conv.weight.detach().clone())
@@ -81,6 +92,7 @@ class QuantConv2d(nn.Module):
             "dilation": conv.dilation,
             "groups": conv.groups,
         }
+        self.weight_quantizer.calibrate(self.weight)
 
     def set_quant_flag(self, enable: bool) -> None:
         self.quant = enable
@@ -94,21 +106,18 @@ class QuantConv2d(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         if not self.quant:
             return F.conv2d(x, self.weight, self.bias, **self.kwargs)
-
         w = self.weight_quantizer.quantise(self.weight)
-        out = F.conv2d(self.act_quantizer(x), w, self.bias, **self.kwargs)
-        return out
+        return F.conv2d(self.act_quantizer(x), w, self.bias, **self.kwargs)
 
 
 class QuantLinear(nn.Module):
-    def __init__(self, config: dict) -> None:
+    def __init__(self, w_bit: int, a_bit: int) -> None:
         super().__init__()
-        bit = config.get("bit", 4)
         self.weight = nn.Parameter(torch.empty(0))
         self.bias: Optional[nn.Parameter] = None
         self.quant = True
-        self.weight_quantizer = FakeQuantizerWeight(bit=bit)
-        self.act_quantizer = FakeQuantizerAct(bit=bit)
+        self.weight_quantizer = FakeQuantizerWeight(bit=w_bit)
+        self.act_quantizer = FakeQuantizerAct(bit=a_bit)
 
     def set_param(self, linear: nn.Linear) -> None:
         self.weight = nn.Parameter(linear.weight.detach().clone())
@@ -116,7 +125,7 @@ class QuantLinear(nn.Module):
             self.bias = nn.Parameter(linear.bias.detach().clone())
         else:
             self.bias = None
-
+        self.weight_quantizer.calibrate(self.weight)
 
     def set_quant_flag(self, enable: bool) -> None:
         self.quant = enable

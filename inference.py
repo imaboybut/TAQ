@@ -21,7 +21,7 @@ from archs.realviformer_arch import RealViformer  # type: ignore  # noqa: E402
 from data_util import read_img_seq  # type: ignore  # noqa: E402
 from img_util import tensor2img  # type: ignore  # noqa: E402
 
-from TAQ import TAQ  # noqa: E402
+from TAQ import TAQ, build_realviformer  # noqa: E402
 
 def load_state_dict(fp_model: RealViformer, model_path: str) -> None:
     state = torch.load(model_path, map_location="cpu")
@@ -157,29 +157,6 @@ def _parse_range_blob(blob) -> Dict[str, Tuple[float, float]]:
     return parsed
 
 
-def _apply_ranges(wrapper: TAQ, ranges: Dict[str, Tuple[float, float]], *, kind: str) -> None:
-    for name, module in wrapper.quant_modules.items():
-        getter_name = "get_act_quantizer" if kind == "act" else "get_weight_quantizer"
-        getter = getattr(module, getter_name, None)
-        if getter is None:
-            continue
-        quantizer = getter()
-        if quantizer is None:
-            continue
-        bounds = ranges.get(name)
-        if bounds is None:
-            continue
-        lb, ub = bounds
-        if hasattr(quantizer, "set_params_lb_manually"):
-            quantizer.set_params_lb_manually(lb)
-        else:
-            quantizer.lb = torch.tensor(lb, device=quantizer.lb.device)
-        if hasattr(quantizer, "set_params_ub_manually"):
-            quantizer.set_params_ub_manually(ub)
-        else:
-            quantizer.ub = torch.tensor(ub, device=quantizer.ub.device)
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -188,7 +165,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional FP32 checkpoint; omit to rely solely on --quant_state_path.",
     )
-    parser.add_argument("--quant_state_path", type=str, required=True, help="Checkpoint exported by save_pth.py")
+    parser.add_argument("--quant_state_path", type=str, required=True, help="Checkpoint exported by calibrate.py")
     parser.add_argument("--lq_root", type=str, required=True, help="Directory with input LQ frame folders.")
     parser.add_argument("--sequences", type=str, default=None, help="Comma-separated subset of sequence names.")
     parser.add_argument(
@@ -208,6 +185,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--a_bit", type=int, default=8)
     parser.add_argument("--no_quant_conv", action="store_true")
     parser.add_argument("--no_quant_linear", action="store_true")
+    parser.add_argument(
+        "--skip_io_layers",
+        action="store_true",
+        help="Keep shallow_extraction.0 and conv_last in FP32; must match the checkpoint "
+        "(read from the checkpoint meta when present).",
+    )
     return parser.parse_args()
 
 
@@ -226,43 +209,23 @@ def main() -> None:
     save_root = resolve_path(args.save_root, must_exist=False)
     save_root.mkdir(parents=True, exist_ok=True)
 
-    fp_model = RealViformer(
-        num_feat=48,
-        num_blocks=[2, 3, 4, 1],
-        spynet_path=None,
-        heads=[1, 2, 4],
-        ffn_expansion_factor=2.66,
-        merge_head=2,
-        bias=False,
-        LayerNorm_type="BiasFree",
-        ch_compress=True,
-        squeeze_factor=[4, 4, 4],
-        masked=True,
-    )
+    fp_model = build_realviformer()
     if args.model_path:
         model_path = resolve_path(args.model_path, must_exist=True)
         load_state_dict(fp_model, str(model_path))
     else:
         print("[INFO] --model_path not provided, skipping FP32 checkpoint load.")
 
-    quant_wrapper = TAQ(
-        fp_model,
-        device=device,
-        w_bit=args.w_bit,
-        a_bit=args.a_bit,
-        quantize_conv=not args.no_quant_conv,
-        quantize_linear=not args.no_quant_linear,
-    )
-    print(f"[INFO] Injected {len(quant_wrapper.quant_modules)} quant module(s).")
-
     quant_state_path = resolve_path(args.quant_state_path, must_exist=True)
     checkpoint = torch.load(str(quant_state_path), map_location="cpu")
     act_ranges_blob = None
     weight_ranges_blob = None
+    meta: Dict = {}
     state = checkpoint
     if isinstance(checkpoint, dict):
         act_ranges_blob = checkpoint.get("act_ranges") or checkpoint.get("ranges")
         weight_ranges_blob = checkpoint.get("weight_ranges")
+        meta = checkpoint.get("meta") or {}
         if "state_dict" in checkpoint:
             state = checkpoint["state_dict"]
         elif "params" in checkpoint:
@@ -271,6 +234,19 @@ def main() -> None:
         raise RuntimeError(f"Unsupported checkpoint format at {args.quant_state_path}")
     state = dict(state)
     state.pop("attn_merge.attn.masktemp", None)
+
+    skip_io_layers = bool(args.skip_io_layers or meta.get("skip_io_layers", False))
+    quant_wrapper = TAQ(
+        fp_model,
+        device=device,
+        w_bit=args.w_bit,
+        a_bit=args.a_bit,
+        quantize_conv=not args.no_quant_conv,
+        quantize_linear=not args.no_quant_linear,
+        skip_io_layers=skip_io_layers,
+    )
+    print(f"[INFO] Injected {len(quant_wrapper.quant_modules)} quant module(s) (skip_io_layers={skip_io_layers}).")
+
     missing, unexpected = quant_wrapper.quant_model.load_state_dict(state, strict=False)
     if missing:
         print(f"[WARN] Missing {len(missing)} parameter(s) while loading quant checkpoint; first: {missing[:5]}")
@@ -283,12 +259,12 @@ def main() -> None:
     weight_ranges = _parse_range_blob(weight_ranges_blob)
     if act_ranges:
         print(f"[INFO] Restored {len(act_ranges)} activation range(s) from checkpoint.")
-        _apply_ranges(quant_wrapper, act_ranges, kind="act")
+        quant_wrapper.apply_ranges(act_ranges, "act")
     else:
-        print("[WARN] No activation ranges bundled in quant checkpoint; activations may be over-clipped.")
+        print("[WARN] No activation ranges bundled in quant checkpoint; activation quantizers stay identity.")
     if weight_ranges:
         print(f"[INFO] Restored {len(weight_ranges)} weight range(s) from checkpoint.")
-        _apply_ranges(quant_wrapper, weight_ranges, kind="weight")
+        quant_wrapper.apply_ranges(weight_ranges, "weight")
     quant_model = quant_wrapper.quant_model.to(device).eval()
 
     print(f"[INFER] Running {len(lq_sequences)} sequence(s). Output -> {save_root}")
